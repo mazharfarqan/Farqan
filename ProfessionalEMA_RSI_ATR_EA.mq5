@@ -1,62 +1,55 @@
 #property strict
-#property version   "1.00"
-#property description "Professional EMA/RSI/ATR Expert Advisor with risk management and execution safety"
+#property version   "2.00"
+#property description "Professional M1 scalping EA with institutional-grade execution safety"
 
 #include <Trade/Trade.mqh>
 
-input long   magic_number               = 90527131;
-input double risk_percent               = 1.0;
-input double rr_ratio                   = 2.0;
-input double atr_multiplier             = 1.5;
-input int    max_spread_points          = 30;
-input double max_daily_drawdown_percent = 5.0;
-input int    trading_start_hour         = 0;
-input int    trading_end_hour           = 23;
-input int    ema_fast                   = 50;
-input int    ema_slow                   = 200;
-input int    rsi_period                 = 14;
-input int    atr_period                 = 14;
-input int    max_slippage_points        = 20;
-input int    retry_count                = 3;
-input int    retry_delay_ms             = 300;
+input long   magic_number         = 90527197;
+input double risk_percent         = 1.0;
+input double atr_multiplier       = 1.4;
+input double rr_ratio             = 1.2;
+input int    max_spread           = 18;
+input double max_daily_loss       = 4.0;
+input int    max_trades_per_day   = 8;
+input int    session_start        = 7;
+input int    session_end          = 21;
+input double min_atr              = 0.00035;
+
+input int    slippage_points      = 10;
+input int    max_retries          = 5;
+input int    retry_delay_ms       = 120;
+
+input int    ema_fast_period      = 20;
+input int    ema_trend_period     = 50;
+input int    rsi_period           = 7;
+input int    adx_period           = 14;
+input int    atr_period           = 14;
+input double adx_minimum          = 20.0;
 
 CTrade trade;
 
-int      hEMAfast = INVALID_HANDLE;
-int      hEMAslow = INVALID_HANDLE;
-int      hRSI     = INVALID_HANDLE;
-int      hATR     = INVALID_HANDLE;
-datetime last_bar_time = 0;
+int      hEMA20 = INVALID_HANDLE;
+int      hEMA50 = INVALID_HANDLE;
+int      hRSI   = INVALID_HANDLE;
+int      hADX   = INVALID_HANDLE;
+int      hATR   = INVALID_HANDLE;
 
+datetime last_bar_time = 0;
+int      day_of_year   = -1;
 double   day_start_balance = 0.0;
-int      day_of_year       = -1;
+int      trades_today = 0;
 
 void Log(const string msg)
 {
-   Print("[EA] ", msg);
+   Print("[SCALPER] ", msg);
 }
 
-bool IsNewBar()
+string GvPartialKey(const ulong ticket)
 {
-   datetime bar_time = iTime(_Symbol, _Period, 0);
-   if(bar_time <= 0)
-      return false;
-
-   if(last_bar_time == 0)
-   {
-      last_bar_time = bar_time;
-      return false;
-   }
-
-   if(bar_time != last_bar_time)
-   {
-      last_bar_time = bar_time;
-      return true;
-   }
-   return false;
+   return StringFormat("SCALPER_PARTIAL_%I64u_%s", ticket, _Symbol);
 }
 
-void UpdateDailyBaseline()
+void ResetDailyCountersIfNeeded()
 {
    MqlDateTime now;
    TimeToStruct(TimeCurrent(), now);
@@ -64,112 +57,145 @@ void UpdateDailyBaseline()
    {
       day_of_year = now.day_of_year;
       day_start_balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      Log(StringFormat("New day baseline set. Day=%d Balance=%.2f", day_of_year, day_start_balance));
+      trades_today = 0;
+      Log(StringFormat("New day reset. day=%d start_balance=%.2f", day_of_year, day_start_balance));
    }
 }
 
-bool IsDailyDrawdownExceeded()
+bool IsNewBar()
 {
-   if(day_start_balance <= 0.0)
+   datetime t0 = iTime(_Symbol, PERIOD_M1, 0);
+   if(t0 <= 0)
       return false;
 
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double dd_pct = 100.0 * (day_start_balance - equity) / day_start_balance;
-   if(dd_pct >= max_daily_drawdown_percent)
+   if(last_bar_time == 0)
    {
-      Log(StringFormat("Daily drawdown limit reached: %.2f%% >= %.2f%%", dd_pct, max_daily_drawdown_percent));
+      last_bar_time = t0;
+      return false;
+   }
+
+   if(t0 != last_bar_time)
+   {
+      last_bar_time = t0;
       return true;
    }
    return false;
 }
 
-bool IsWithinTradingHours()
+bool IsWithinSession()
 {
    MqlDateTime now;
    TimeToStruct(TimeCurrent(), now);
 
-   if(trading_start_hour == trading_end_hour)
+   if(session_start == session_end)
       return true;
 
-   if(trading_start_hour < trading_end_hour)
-      return (now.hour >= trading_start_hour && now.hour < trading_end_hour);
+   if(session_start < session_end)
+      return (now.hour >= session_start && now.hour < session_end);
 
-   return (now.hour >= trading_start_hour || now.hour < trading_end_hour);
+   return (now.hour >= session_start || now.hour < session_end);
 }
 
-bool IsSpreadOk()
+bool IsDailyLossHit()
 {
-   MqlTick tick;
+   if(day_start_balance <= 0.0)
+      return false;
+
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double loss_pct = 100.0 * (day_start_balance - equity) / day_start_balance;
+   if(loss_pct >= max_daily_loss)
+   {
+      Log(StringFormat("Trading blocked: daily loss %.2f%% >= %.2f%%", loss_pct, max_daily_loss));
+      return true;
+   }
+   return false;
+}
+
+bool IsSpreadValid(MqlTick &tick, double &spread_points)
+{
    if(!SymbolInfoTick(_Symbol, tick))
    {
-      Log("Failed to get symbol tick for spread check.");
+      Log("Trading blocked: SymbolInfoTick failed.");
       return false;
    }
 
-   double spread_points = (tick.ask - tick.bid) / _Point;
-   if(spread_points > max_spread_points)
+   spread_points = (tick.ask - tick.bid) / _Point;
+   if(spread_points > max_spread)
    {
-      Log(StringFormat("Spread too high: %.1f points > %d", spread_points, max_spread_points));
+      Log(StringFormat("Trading blocked: spread %.1f > max %d", spread_points, max_spread));
       return false;
    }
    return true;
 }
 
-bool HasOpenPositionOnSymbol()
+bool HasAnyOpenPositionOnSymbol()
 {
-   if(!PositionSelect(_Symbol))
+   return PositionSelect(_Symbol);
+}
+
+bool CheckStopsAndFreezeDistance(const ENUM_ORDER_TYPE type, const double price, const double sl, const double tp)
+{
+   int stop_level_pts   = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   int freeze_level_pts = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+
+   double min_stop   = stop_level_pts * _Point;
+   double min_freeze = freeze_level_pts * _Point;
+
+   double dsl = MathAbs(price - sl);
+   double dtp = MathAbs(tp - price);
+
+   if(dsl < min_stop || dtp < min_stop)
+   {
+      Log(StringFormat("Trading blocked: invalid stops. dSL=%.5f dTP=%.5f minStop=%.5f", dsl, dtp, min_stop));
+      return false;
+   }
+
+   if(dsl <= min_freeze || dtp <= min_freeze)
+   {
+      Log(StringFormat("Trading blocked: freeze level violation. dSL=%.5f dTP=%.5f freeze=%.5f", dsl, dtp, min_freeze));
+      return false;
+   }
+
+   if(type == ORDER_TYPE_BUY && !(sl < price && tp > price))
+      return false;
+   if(type == ORDER_TYPE_SELL && !(sl > price && tp < price))
       return false;
 
-   long mg = PositionGetInteger(POSITION_MAGIC);
-   if(mg == magic_number)
-      return true;
-
-   Log("Existing position detected on symbol (different magic). New trade blocked by one-trade-per-symbol rule.");
    return true;
 }
 
-bool IsTradingAllowedForDirection(const ENUM_ORDER_TYPE type)
+double NormalizeVolume(double vol)
 {
-   long trade_mode = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
-   if(trade_mode == SYMBOL_TRADE_MODE_DISABLED)
-   {
-      Log("Trading disabled for symbol.");
-      return false;
-   }
+   double vmin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vmax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double vstep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
-   if(type == ORDER_TYPE_BUY && trade_mode == SYMBOL_TRADE_MODE_SHORTONLY)
-   {
-      Log("Buy not allowed: symbol is short-only.");
-      return false;
-   }
-
-   if(type == ORDER_TYPE_SELL && trade_mode == SYMBOL_TRADE_MODE_LONGONLY)
-   {
-      Log("Sell not allowed: symbol is long-only.");
-      return false;
-   }
-
-   return true;
-}
-
-double NormalizeVolume(const double vol)
-{
-   double min_vol  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double max_vol  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   double step_vol = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
-   if(step_vol <= 0.0)
+   if(vstep <= 0.0)
       return 0.0;
 
-   double normalized = MathFloor(vol / step_vol) * step_vol;
-   normalized = MathMax(min_vol, normalized);
-   normalized = MathMin(max_vol, normalized);
-   return normalized;
+   vol = MathFloor(vol / vstep) * vstep;
+   if(vol < vmin)
+      vol = vmin;
+   if(vol > vmax)
+      vol = vmax;
+
+   int vol_digits = 0;
+   if(vstep < 1.0)
+   {
+      double x = vstep;
+      while(x < 1.0 && vol_digits < 8)
+      {
+         x *= 10.0;
+         vol_digits++;
+      }
+   }
+
+   return NormalizeDouble(vol, vol_digits);
 }
 
-double CalculateLotByRisk(const double sl_distance_points)
+double CalculateRiskLot(const double stop_points)
 {
-   if(sl_distance_points <= 0.0)
+   if(stop_points <= 0.0)
       return 0.0;
 
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -180,7 +206,7 @@ double CalculateLotByRisk(const double sl_distance_points)
 
    if(tick_value <= 0.0 || tick_size <= 0.0)
    {
-      Log("Invalid tick value/tick size, cannot calculate lot.");
+      Log("Risk calc blocked: invalid tick_value/tick_size.");
       return 0.0;
    }
 
@@ -188,98 +214,146 @@ double CalculateLotByRisk(const double sl_distance_points)
    if(value_per_point_per_lot <= 0.0)
       return 0.0;
 
-   double raw_lot = risk_amount / (sl_distance_points * value_per_point_per_lot);
+   double raw_lot = risk_amount / (stop_points * value_per_point_per_lot);
    double lot = NormalizeVolume(raw_lot);
 
-   Log(StringFormat("Lot calc: balance=%.2f risk=%.2f sl_points=%.1f raw=%.4f lot=%.2f",
-                    balance, risk_amount, sl_distance_points, raw_lot, lot));
+   Log(StringFormat("Risk calc: balance=%.2f risk=%.2f stop_points=%.1f raw=%.4f lot=%.2f",
+                    balance, risk_amount, stop_points, raw_lot, lot));
 
    return lot;
 }
 
-bool CheckFreeMargin(const ENUM_ORDER_TYPE type, const double volume, const double price)
+bool CheckMargin(const ENUM_ORDER_TYPE type, const double volume, const double price)
 {
    double margin = 0.0;
    if(!OrderCalcMargin(type, _Symbol, volume, price, margin))
    {
-      Log(StringFormat("OrderCalcMargin failed. err=%d", GetLastError()));
+      Log(StringFormat("Trading blocked: OrderCalcMargin failed err=%d", GetLastError()));
       return false;
    }
 
    double free_margin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
    if(free_margin < margin)
    {
-      Log(StringFormat("Insufficient free margin. Required=%.2f Free=%.2f", margin, free_margin));
+      Log(StringFormat("Trading blocked: insufficient margin free=%.2f required=%.2f", free_margin, margin));
       return false;
    }
+   return true;
+}
+
+bool LoadIndicators(double &ema20_1, double &ema50_1,
+                    double &rsi_1, double &rsi_2,
+                    double &adx_1, double &atr_1,
+                    double &open_1, double &close_1,
+                    double &low_1, double &high_1,
+                    double &close_2)
+{
+   double bEMA20[1], bEMA50[1], bRSI[2], bADX[1], bATR[1], bOpen1[1], bClose1[1], bLow1[1], bHigh1[1], bClose2[1];
+
+   if(CopyBuffer(hEMA20, 0, 1, 1, bEMA20) != 1) return false;
+   if(CopyBuffer(hEMA50, 0, 1, 1, bEMA50) != 1) return false;
+   if(CopyBuffer(hRSI,   0, 1, 2, bRSI)   != 2) return false;
+   if(CopyBuffer(hADX,   0, 1, 1, bADX)   != 1) return false;
+   if(CopyBuffer(hATR,   0, 1, 1, bATR)   != 1) return false;
+
+   if(CopyOpen(_Symbol, PERIOD_M1, 1, 1, bOpen1)  != 1) return false;
+   if(CopyClose(_Symbol, PERIOD_M1, 1, 1, bClose1)!= 1) return false;
+   if(CopyLow(_Symbol, PERIOD_M1, 1, 1, bLow1)    != 1) return false;
+   if(CopyHigh(_Symbol, PERIOD_M1, 1, 1, bHigh1)  != 1) return false;
+   if(CopyClose(_Symbol, PERIOD_M1, 2, 1, bClose2)!= 1) return false;
+
+   ema20_1 = bEMA20[0];
+   ema50_1 = bEMA50[0];
+   rsi_1   = bRSI[0];
+   rsi_2   = bRSI[1];
+   adx_1   = bADX[0];
+   atr_1   = bATR[0];
+
+   open_1  = bOpen1[0];
+   close_1 = bClose1[0];
+   low_1   = bLow1[0];
+   high_1  = bHigh1[0];
+   close_2 = bClose2[0];
 
    return true;
 }
 
-bool BuildStops(const ENUM_ORDER_TYPE type, const double entry_price, const double atr_value, double &sl, double &tp, double &risk_distance)
+bool CalcSessionVWAP(double &vwap)
 {
-   if(atr_value <= 0.0)
+   MqlDateTime now;
+   TimeToStruct(TimeCurrent(), now);
+   now.hour = 0;
+   now.min = 0;
+   now.sec = 0;
+   datetime day_start = StructToTime(now);
+
+   int bars = Bars(_Symbol, PERIOD_M1, day_start, TimeCurrent());
+   if(bars <= 2)
       return false;
 
-   double raw_risk = atr_value * atr_multiplier;
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(_Symbol, PERIOD_M1, 1, bars - 1, rates);
+   if(copied <= 0)
+      return false;
 
-   int stop_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double min_stop_distance = stop_level * _Point;
+   double pv_sum = 0.0;
+   double vol_sum = 0.0;
 
-   risk_distance = MathMax(raw_risk, min_stop_distance + _Point);
-
-   if(type == ORDER_TYPE_BUY)
+   for(int i = copied - 1; i >= 0; i--)
    {
-      sl = entry_price - risk_distance;
-      tp = entry_price + risk_distance * rr_ratio;
-   }
-   else
-   {
-      sl = entry_price + risk_distance;
-      tp = entry_price - risk_distance * rr_ratio;
+      double tp = (rates[i].high + rates[i].low + rates[i].close) / 3.0;
+      double vol = (double)rates[i].tick_volume;
+      if(vol <= 0.0)
+         vol = 1.0;
+      pv_sum += tp * vol;
+      vol_sum += vol;
    }
 
-   sl = NormalizeDouble(sl, _Digits);
-   tp = NormalizeDouble(tp, _Digits);
+   if(vol_sum <= 0.0)
+      return false;
 
+   vwap = pv_sum / vol_sum;
    return true;
 }
 
-bool SendOrderWithRetry(const ENUM_ORDER_TYPE type, const double volume, const double sl, const double tp)
+bool RetryableRetcode(const long rc)
 {
-   bool result = false;
+   return (rc == TRADE_RETCODE_REQUOTE ||
+           rc == TRADE_RETCODE_PRICE_CHANGED ||
+           rc == TRADE_RETCODE_INVALID_PRICE ||
+           rc == TRADE_RETCODE_TRADE_CONTEXT_BUSY ||
+           rc == TRADE_RETCODE_TOO_MANY_REQUESTS ||
+           rc == TRADE_RETCODE_CONNECTION ||
+           rc == TRADE_RETCODE_TIMEOUT);
+}
 
-   for(int i = 0; i < retry_count; i++)
+bool ExecuteOrder(const ENUM_ORDER_TYPE type, const double volume, const double sl, const double tp)
+{
+   for(int i = 0; i < max_retries; i++)
    {
-      ResetLastError();
       trade.SetExpertMagicNumber(magic_number);
-      trade.SetDeviationInPoints(max_slippage_points);
+      trade.SetDeviationInPoints(slippage_points);
+      ResetLastError();
 
+      bool ok = false;
       if(type == ORDER_TYPE_BUY)
-         result = trade.Buy(volume, _Symbol, 0.0, sl, tp, "EMA/RSI Buy");
+         ok = trade.Buy(volume, _Symbol, 0.0, sl, tp, "SCALP_BUY");
       else
-         result = trade.Sell(volume, _Symbol, 0.0, sl, tp, "EMA/RSI Sell");
+         ok = trade.Sell(volume, _Symbol, 0.0, sl, tp, "SCALP_SELL");
 
-      long retcode = trade.ResultRetcode();
-      string retmsg = trade.ResultRetcodeDescription();
+      long rc = trade.ResultRetcode();
+      string rd = trade.ResultRetcodeDescription();
 
-      if(result && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED))
+      if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
       {
-         Log(StringFormat("Order success [%d/%d]. Retcode=%d (%s)", i + 1, retry_count, retcode, retmsg));
+         Log(StringFormat("Order executed [%d/%d] ret=%d %s", i + 1, max_retries, rc, rd));
          return true;
       }
 
-      Log(StringFormat("Order attempt failed [%d/%d]. Retcode=%d (%s) LastError=%d",
-                       i + 1, retry_count, retcode, retmsg, GetLastError()));
-
-      bool retryable = (retcode == TRADE_RETCODE_REQUOTE ||
-                        retcode == TRADE_RETCODE_PRICE_CHANGED ||
-                        retcode == TRADE_RETCODE_REJECT ||
-                        retcode == TRADE_RETCODE_TIMEOUT ||
-                        retcode == TRADE_RETCODE_CONNECTION);
-
-      if(!retryable)
-         break;
+      Log(StringFormat("Order failed [%d/%d] ret=%d %s err=%d", i + 1, max_retries, rc, rd, GetLastError()));
+      if(!RetryableRetcode(rc))
+         return false;
 
       Sleep(retry_delay_ms);
    }
@@ -287,241 +361,296 @@ bool SendOrderWithRetry(const ENUM_ORDER_TYPE type, const double volume, const d
    return false;
 }
 
-void ManagePositionTrailingAndBreakeven()
+bool ModifyPositionSLTP(const double new_sl, const double tp)
+{
+   int freeze_level_pts = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double freeze_dist = freeze_level_pts * _Point;
+
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return false;
+
+   ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double ref_price = (ptype == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
+
+   if(MathAbs(ref_price - new_sl) <= freeze_dist)
+   {
+      Log("SL modify blocked: freeze level too close.");
+      return false;
+   }
+
+   trade.SetExpertMagicNumber(magic_number);
+
+   for(int i = 0; i < max_retries; i++)
+   {
+      bool ok = trade.PositionModify(_Symbol, NormalizeDouble(new_sl, _Digits), NormalizeDouble(tp, _Digits));
+      long rc = trade.ResultRetcode();
+      if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
+         return true;
+
+      if(!RetryableRetcode(rc))
+         return false;
+
+      Sleep(retry_delay_ms);
+   }
+
+   return false;
+}
+
+void ManageOpenPosition()
 {
    if(!PositionSelect(_Symbol))
       return;
 
-   long mg = PositionGetInteger(POSITION_MAGIC);
-   if(mg != magic_number)
+   long pmagic = PositionGetInteger(POSITION_MAGIC);
+   if(pmagic != magic_number)
       return;
 
-   ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   ulong  ticket     = (ulong)PositionGetInteger(POSITION_TICKET);
+   double volume     = PositionGetDouble(POSITION_VOLUME);
    double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
    double sl         = PositionGetDouble(POSITION_SL);
    double tp         = PositionGetDouble(POSITION_TP);
+   ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
-   double atr_buf[];
-   if(CopyBuffer(hATR, 0, 1, 1, atr_buf) <= 0)
+   double atrb[1];
+   if(CopyBuffer(hATR, 0, 1, 1, atrb) != 1)
       return;
 
-   double atr_value = atr_buf[0];
-   if(atr_value <= 0.0)
+   double atr = atrb[0];
+   if(atr <= 0.0)
       return;
 
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
       return;
 
-   double risk_distance = atr_value * atr_multiplier;
-   int stop_level = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double min_stop_distance = stop_level * _Point;
-   risk_distance = MathMax(risk_distance, min_stop_distance + _Point);
+   double risk_dist = MathMax(atr * atr_multiplier, (double)((int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) + 1) * _Point);
+   double price_now = (ptype == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
+   double profit_dist = (ptype == POSITION_TYPE_BUY) ? (price_now - open_price) : (open_price - price_now);
 
-   double current_price = (pos_type == POSITION_TYPE_BUY) ? tick.bid : tick.ask;
-   double move_in_profit = (pos_type == POSITION_TYPE_BUY) ? (current_price - open_price) : (open_price - current_price);
-
-   bool need_modify = false;
-   double new_sl = sl;
-
-   if(move_in_profit >= risk_distance)
+   double be_trigger = 0.8 * risk_dist;
+   if(profit_dist >= be_trigger)
    {
       double be_sl = open_price;
-      if(pos_type == POSITION_TYPE_BUY)
+      bool move_be = false;
+      if(ptype == POSITION_TYPE_BUY && (sl < be_sl || sl == 0.0)) move_be = true;
+      if(ptype == POSITION_TYPE_SELL && (sl > be_sl || sl == 0.0)) move_be = true;
+
+      if(move_be && ModifyPositionSLTP(be_sl, tp))
       {
-         if(sl < be_sl)
-         {
-            new_sl = be_sl;
-            need_modify = true;
-         }
+         Log(StringFormat("Exit mgmt: Break-even moved at +0.8R, new SL=%.5f", be_sl));
+         sl = be_sl;
       }
-      else
+   }
+
+   string partial_key = GvPartialKey(ticket);
+   bool partial_done = GlobalVariableCheck(partial_key);
+   if(!partial_done && profit_dist >= risk_dist)
+   {
+      double vstep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      double minv  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double close_vol = NormalizeVolume(volume * 0.5);
+
+      if(close_vol >= minv && (volume - close_vol) >= minv && vstep > 0.0)
       {
-         if(sl == 0.0 || sl > be_sl)
+         trade.SetExpertMagicNumber(magic_number);
+         trade.SetDeviationInPoints(slippage_points);
+         bool closed = trade.PositionClosePartial(_Symbol, close_vol);
+         long rc = trade.ResultRetcode();
+         if(closed && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
          {
-            new_sl = be_sl;
-            need_modify = true;
+            GlobalVariableSet(partial_key, (double)TimeCurrent());
+            Log(StringFormat("Exit mgmt: Partial close 50%% done at 1R, closed=%.2f", close_vol));
          }
       }
    }
 
-   double trail_sl;
-   if(pos_type == POSITION_TYPE_BUY)
+   if(profit_dist >= be_trigger)
    {
-      trail_sl = tick.bid - risk_distance;
-      if((new_sl == 0.0 || trail_sl > new_sl) && (tick.bid - trail_sl) >= min_stop_distance)
-      {
-         new_sl = trail_sl;
-         need_modify = true;
-      }
-   }
-   else
-   {
-      trail_sl = tick.ask + risk_distance;
-      if((new_sl == 0.0 || trail_sl < new_sl) && (trail_sl - tick.ask) >= min_stop_distance)
-      {
-         new_sl = trail_sl;
-         need_modify = true;
-      }
-   }
+      double trail_sl = (ptype == POSITION_TYPE_BUY) ? (price_now - risk_dist) : (price_now + risk_dist);
+      bool improve = false;
 
-   if(need_modify)
-   {
-      new_sl = NormalizeDouble(new_sl, _Digits);
-      trade.SetExpertMagicNumber(magic_number);
-      if(trade.PositionModify(_Symbol, new_sl, tp))
-      {
-         Log(StringFormat("Position modified. New SL=%.5f TP=%.5f", new_sl, tp));
-      }
-      else
-      {
-         Log(StringFormat("Position modify failed. Retcode=%d (%s)", trade.ResultRetcode(), trade.ResultRetcodeDescription()));
-      }
+      if(ptype == POSITION_TYPE_BUY && trail_sl > sl) improve = true;
+      if(ptype == POSITION_TYPE_SELL && (sl == 0.0 || trail_sl < sl)) improve = true;
+
+      if(improve && ModifyPositionSLTP(trail_sl, tp))
+         Log(StringFormat("Exit mgmt: ATR trailing SL updated to %.5f", trail_sl));
    }
 }
 
-bool GetIndicators(double &ema_fast_prev, double &ema_fast_curr,
-                   double &ema_slow_prev, double &ema_slow_curr,
-                   double &rsi_curr, double &atr_curr,
-                   double &close_prev)
+void EvaluateEntries()
 {
-   double fast_buf[2], slow_buf[2], rsi_buf[1], atr_buf[1], close_buf[1];
+   ResetDailyCountersIfNeeded();
 
-   if(CopyBuffer(hEMAfast, 0, 1, 2, fast_buf) != 2)
-      return false;
-   if(CopyBuffer(hEMAslow, 0, 1, 2, slow_buf) != 2)
-      return false;
-   if(CopyBuffer(hRSI, 0, 1, 1, rsi_buf) != 1)
-      return false;
-   if(CopyBuffer(hATR, 0, 1, 1, atr_buf) != 1)
-      return false;
-   if(CopyClose(_Symbol, _Period, 1, 1, close_buf) != 1)
-      return false;
+   if(IsDailyLossHit())
+      return;
 
-   ema_fast_curr = fast_buf[0];
-   ema_fast_prev = fast_buf[1];
-   ema_slow_curr = slow_buf[0];
-   ema_slow_prev = slow_buf[1];
-   rsi_curr      = rsi_buf[0];
-   atr_curr      = atr_buf[0];
-   close_prev    = close_buf[0];
-
-   return true;
-}
-
-void EvaluateEntryOnNewBar()
-{
-   if(!IsWithinTradingHours())
+   if(trades_today >= max_trades_per_day)
    {
-      Log("Outside trading session.");
+      Log(StringFormat("Trading blocked: max trades/day reached (%d)", trades_today));
       return;
    }
 
-   if(IsDailyDrawdownExceeded())
-      return;
-
-   if(!IsSpreadOk())
-      return;
-
-   if(HasOpenPositionOnSymbol())
-      return;
-
-   double ema_fast_prev, ema_fast_curr, ema_slow_prev, ema_slow_curr, rsi_curr, atr_curr, close_prev;
-   if(!GetIndicators(ema_fast_prev, ema_fast_curr, ema_slow_prev, ema_slow_curr, rsi_curr, atr_curr, close_prev))
+   if(!IsWithinSession())
    {
-      Log("Failed to read indicators.");
+      Log("Trading blocked: outside London/NY session window.");
       return;
    }
 
-   bool cross_up   = (ema_fast_prev <= ema_slow_prev && ema_fast_curr > ema_slow_curr);
-   bool cross_down = (ema_fast_prev >= ema_slow_prev && ema_fast_curr < ema_slow_curr);
+   if(HasAnyOpenPositionOnSymbol())
+   {
+      Log("Trading blocked: one position per symbol rule.");
+      return;
+   }
 
-   bool buy_signal  = cross_up && (close_prev > ema_slow_curr) && (rsi_curr > 55.0);
-   bool sell_signal = cross_down && (close_prev < ema_slow_curr) && (rsi_curr < 45.0);
+   MqlTick tick;
+   double spread_pts = 0.0;
+   if(!IsSpreadValid(tick, spread_pts))
+      return;
+
+   double ema20_1 = 0.0, ema50_1 = 0.0, rsi_1 = 0.0, rsi_2 = 0.0, adx_1 = 0.0, atr_1 = 0.0;
+   double open_1 = 0.0, close_1 = 0.0, low_1 = 0.0, high_1 = 0.0, close_2 = 0.0;
+
+   if(!LoadIndicators(ema20_1, ema50_1, rsi_1, rsi_2, adx_1, atr_1, open_1, close_1, low_1, high_1, close_2))
+   {
+      Log("Trading blocked: indicator load failed.");
+      return;
+   }
+
+   if(atr_1 < min_atr)
+   {
+      Log(StringFormat("Trading blocked: ATR %.5f < min %.5f", atr_1, min_atr));
+      return;
+   }
+
+   if(adx_1 < adx_minimum)
+   {
+      Log(StringFormat("Trading blocked: ADX %.2f < %.2f", adx_1, adx_minimum));
+      return;
+   }
+
+   double vwap = 0.0;
+   if(!CalcSessionVWAP(vwap))
+   {
+      Log("Trading blocked: VWAP calculation failed.");
+      return;
+   }
+
+   bool trend_up   = (close_1 > ema50_1 && close_1 > vwap && close_1 > close_2);
+   bool trend_down = (close_1 < ema50_1 && close_1 < vwap && close_1 < close_2);
+
+   bool pullback_buy  = (low_1 <= ema20_1 && close_1 > ema20_1);
+   bool pullback_sell = (high_1 >= ema20_1 && close_1 < ema20_1);
+
+   bool rsi_cross_up   = (rsi_2 <= 50.0 && rsi_1 > 50.0);
+   bool rsi_cross_down = (rsi_2 >= 50.0 && rsi_1 < 50.0);
+
+   bool prev_bull = (close_1 > open_1);
+   bool prev_bear = (close_1 < open_1);
+
+   bool buy_signal  = trend_up && pullback_buy && rsi_cross_up && prev_bull;
+   bool sell_signal = trend_down && pullback_sell && rsi_cross_down && prev_bear;
 
    if(!buy_signal && !sell_signal)
    {
-      Log(StringFormat("No signal. EMAfast_prev=%.5f EMAfast=%.5f EMAslow_prev=%.5f EMAslow=%.5f RSI=%.2f",
-                       ema_fast_prev, ema_fast_curr, ema_slow_prev, ema_slow_curr, rsi_curr));
+      Log(StringFormat("No entry: trendUp=%d trendDn=%d pullBuy=%d pullSell=%d rsiUp=%d rsiDn=%d bull=%d bear=%d",
+                       (int)trend_up, (int)trend_down, (int)pullback_buy, (int)pullback_sell,
+                       (int)rsi_cross_up, (int)rsi_cross_down, (int)prev_bull, (int)prev_bear));
       return;
    }
 
-   MqlTick tick;
-   if(!SymbolInfoTick(_Symbol, tick))
-      return;
+   ENUM_ORDER_TYPE type = buy_signal ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   double entry = buy_signal ? tick.ask : tick.bid;
+   entry = NormalizeDouble(entry, _Digits);
 
-   ENUM_ORDER_TYPE order_type = buy_signal ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   if(!IsTradingAllowedForDirection(order_type))
-      return;
+   double stop_dist = MathMax(atr_1 * atr_multiplier,
+                              (double)((int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) + 1) * _Point);
 
-   double entry_price = buy_signal ? tick.ask : tick.bid;
-   double sl = 0.0, tp = 0.0, risk_distance = 0.0;
+   double sl = 0.0;
+   double tp = 0.0;
 
-   if(!BuildStops(order_type, entry_price, atr_curr, sl, tp, risk_distance))
+   if(type == ORDER_TYPE_BUY)
    {
-      Log("Failed to build stops.");
-      return;
+      sl = NormalizeDouble(entry - stop_dist, _Digits);
+      tp = NormalizeDouble(entry + (stop_dist * rr_ratio), _Digits);
    }
-
-   double sl_points = risk_distance / _Point;
-   double volume = CalculateLotByRisk(sl_points);
-
-   if(volume <= 0.0)
+   else
    {
-      Log("Calculated volume is invalid.");
+      sl = NormalizeDouble(entry + stop_dist, _Digits);
+      tp = NormalizeDouble(entry - (stop_dist * rr_ratio), _Digits);
+   }
+
+   if(!CheckStopsAndFreezeDistance(type, entry, sl, tp))
+      return;
+
+   double stop_points = stop_dist / _Point;
+   double lot = CalculateRiskLot(stop_points);
+   if(lot <= 0.0)
+   {
+      Log("Trading blocked: computed lot <= 0.");
       return;
    }
 
-   if(!CheckFreeMargin(order_type, volume, entry_price))
+   if(!CheckMargin(type, lot, entry))
       return;
 
-   Log(StringFormat("Signal=%s Entry=%.5f SL=%.5f TP=%.5f ATR=%.5f Volume=%.2f",
-                    buy_signal ? "BUY" : "SELL", entry_price, sl, tp, atr_curr, volume));
+   Log(StringFormat("Entry reason: %s trend+VWAP+ADX valid, pullback to EMA20, RSI cross 50, spread=%.1f, ATR=%.5f",
+                    (type == ORDER_TYPE_BUY ? "BUY" : "SELL"), spread_pts, atr_1));
 
-   if(!SendOrderWithRetry(order_type, volume, sl, tp))
-      Log("Order execution failed after retries.");
+   if(ExecuteOrder(type, lot, sl, tp))
+   {
+      trades_today++;
+      Log(StringFormat("Entry executed: %s lot=%.2f entry=%.5f sl=%.5f tp=%.5f trades_today=%d",
+                       (type == ORDER_TYPE_BUY ? "BUY" : "SELL"), lot, entry, sl, tp, trades_today));
+   }
+   else
+   {
+      Log("Entry failed: execution retries exhausted or non-retryable retcode.");
+   }
 }
 
 int OnInit()
 {
+   if(_Period != PERIOD_M1)
+      Log("Warning: EA optimized for M1 timeframe.");
+
    trade.SetExpertMagicNumber(magic_number);
-   trade.SetDeviationInPoints(max_slippage_points);
+   trade.SetDeviationInPoints(slippage_points);
 
-   hEMAfast = iMA(_Symbol, _Period, ema_fast, 0, MODE_EMA, PRICE_CLOSE);
-   hEMAslow = iMA(_Symbol, _Period, ema_slow, 0, MODE_EMA, PRICE_CLOSE);
-   hRSI     = iRSI(_Symbol, _Period, rsi_period, PRICE_CLOSE);
-   hATR     = iATR(_Symbol, _Period, atr_period);
+   hEMA20 = iMA(_Symbol, PERIOD_M1, ema_fast_period, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA50 = iMA(_Symbol, PERIOD_M1, ema_trend_period, 0, MODE_EMA, PRICE_CLOSE);
+   hRSI   = iRSI(_Symbol, PERIOD_M1, rsi_period, PRICE_CLOSE);
+   hADX   = iADX(_Symbol, PERIOD_M1, adx_period);
+   hATR   = iATR(_Symbol, PERIOD_M1, atr_period);
 
-   if(hEMAfast == INVALID_HANDLE || hEMAslow == INVALID_HANDLE || hRSI == INVALID_HANDLE || hATR == INVALID_HANDLE)
+   if(hEMA20 == INVALID_HANDLE || hEMA50 == INVALID_HANDLE || hRSI == INVALID_HANDLE || hADX == INVALID_HANDLE || hATR == INVALID_HANDLE)
    {
-      Log("Indicator handle creation failed.");
+      Log("Initialization failed: indicator handle creation error.");
       return INIT_FAILED;
    }
 
-   UpdateDailyBaseline();
-   Log("EA initialized successfully.");
+   ResetDailyCountersIfNeeded();
+   Log("Initialization complete.");
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
-   if(hEMAfast != INVALID_HANDLE)
-      IndicatorRelease(hEMAfast);
-   if(hEMAslow != INVALID_HANDLE)
-      IndicatorRelease(hEMAslow);
-   if(hRSI != INVALID_HANDLE)
-      IndicatorRelease(hRSI);
-   if(hATR != INVALID_HANDLE)
-      IndicatorRelease(hATR);
+   if(hEMA20 != INVALID_HANDLE) IndicatorRelease(hEMA20);
+   if(hEMA50 != INVALID_HANDLE) IndicatorRelease(hEMA50);
+   if(hRSI   != INVALID_HANDLE) IndicatorRelease(hRSI);
+   if(hADX   != INVALID_HANDLE) IndicatorRelease(hADX);
+   if(hATR   != INVALID_HANDLE) IndicatorRelease(hATR);
 
-   Log(StringFormat("EA deinitialized. Reason=%d", reason));
+   Log(StringFormat("Deinitialized. reason=%d", reason));
 }
 
 void OnTick()
 {
-   UpdateDailyBaseline();
-   ManagePositionTrailingAndBreakeven();
+   ResetDailyCountersIfNeeded();
+   ManageOpenPosition();
 
    if(IsNewBar())
-      EvaluateEntryOnNewBar();
+      EvaluateEntries();
 }
