@@ -232,7 +232,7 @@ bool CheckMargin(const ENUM_ORDER_TYPE type, const double volume, const double p
       return false;
    }
 
-   double free_margin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
    if(free_margin < margin)
    {
       Log(StringFormat("Trading blocked: insufficient margin free=%.2f required=%.2f", free_margin, margin));
@@ -322,8 +322,7 @@ bool RetryableRetcode(const long rc)
    return (rc == TRADE_RETCODE_REQUOTE ||
            rc == TRADE_RETCODE_PRICE_CHANGED ||
            rc == TRADE_RETCODE_INVALID_PRICE ||
-           rc == TRADE_RETCODE_TRADE_CONTEXT_BUSY ||
-           rc == TRADE_RETCODE_TOO_MANY_REQUESTS ||
+                      rc == TRADE_RETCODE_TOO_MANY_REQUESTS ||
            rc == TRADE_RETCODE_CONNECTION ||
            rc == TRADE_RETCODE_TIMEOUT);
 }
@@ -351,8 +350,10 @@ bool ExecuteOrder(const ENUM_ORDER_TYPE type, const double volume, const double 
          return true;
       }
 
-      Log(StringFormat("Order failed [%d/%d] ret=%d %s err=%d", i + 1, max_retries, rc, rd, GetLastError()));
-      if(!RetryableRetcode(rc))
+      int err = GetLastError();
+      Log(StringFormat("Order failed [%d/%d] ret=%d %s err=%d", i + 1, max_retries, rc, rd, err));
+      bool busy_context = (err == ERR_TRADE_CONTEXT_BUSY);
+      if(!RetryableRetcode(rc) && !busy_context)
          return false;
 
       Sleep(retry_delay_ms);
@@ -383,12 +384,15 @@ bool ModifyPositionSLTP(const double new_sl, const double tp)
 
    for(int i = 0; i < max_retries; i++)
    {
+      ResetLastError();
       bool ok = trade.PositionModify(_Symbol, NormalizeDouble(new_sl, _Digits), NormalizeDouble(tp, _Digits));
       long rc = trade.ResultRetcode();
+      int err = GetLastError();
       if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
          return true;
 
-      if(!RetryableRetcode(rc))
+      bool busy_context = (err == ERR_TRADE_CONTEXT_BUSY);
+      if(!RetryableRetcode(rc) && !busy_context)
          return false;
 
       Sleep(retry_delay_ms);
