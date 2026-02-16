@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.00"
+#property version   "1.01"
 #property description "Hedging Martingale Recovery EA for MT5"
 
 input int      EMA_Fast            = 50;
@@ -20,14 +20,25 @@ int      g_emaFastHandle = INVALID_HANDLE;
 int      g_emaSlowHandle = INVALID_HANDLE;
 double   g_initialEquity = 0.0;
 bool     g_tradingStopped = false;
+ulong    g_lastActionTickTime = 0;
 
 struct BasketState
 {
    int                levels;
+   ENUM_POSITION_TYPE firstType;
    ENUM_POSITION_TYPE lastType;
+   ENUM_POSITION_TYPE expectedNextType;
    double             lastPrice;
    ulong              lastTicket;
    double             totalProfit;
+};
+
+struct BasketPosition
+{
+   ulong              ticket;
+   long               timeMsc;
+   ENUM_POSITION_TYPE type;
+   double             price;
 };
 
 bool IsHedgingAccount()
@@ -74,6 +85,9 @@ double NormalizeVolume(double volume)
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(lotStep <= 0.0)
+      return 0.0;
 
    double capped = MathMin(volume, 5.0);
    capped = MathMin(capped, maxLot);
@@ -230,15 +244,46 @@ void CloseAllBasketPositions()
       ClosePositionByTicket(tickets[i]);
 }
 
+void SortBasketPositionsByOpenTime(BasketPosition &arr[])
+{
+   int n = ArraySize(arr);
+   if(n < 2)
+      return;
+
+   for(int i = 0; i < n - 1; i++)
+   {
+      for(int j = i + 1; j < n; j++)
+      {
+         bool swapNeeded = false;
+
+         if(arr[j].timeMsc < arr[i].timeMsc)
+            swapNeeded = true;
+         else if(arr[j].timeMsc == arr[i].timeMsc && arr[j].ticket < arr[i].ticket)
+            swapNeeded = true;
+
+         if(swapNeeded)
+         {
+            BasketPosition tmp = arr[i];
+            arr[i] = arr[j];
+            arr[j] = tmp;
+         }
+      }
+   }
+}
+
 bool GetBasketState(BasketState &state)
 {
-   state.levels     = 0;
-   state.lastType   = POSITION_TYPE_BUY;
-   state.lastPrice  = 0.0;
-   state.lastTicket = 0;
-   state.totalProfit = 0.0;
+   state.levels            = 0;
+   state.firstType         = POSITION_TYPE_BUY;
+   state.lastType          = POSITION_TYPE_BUY;
+   state.expectedNextType  = POSITION_TYPE_SELL;
+   state.lastPrice         = 0.0;
+   state.lastTicket        = 0;
+   state.totalProfit       = 0.0;
 
-   long latestTime = -1;
+   BasketPosition positions[];
+   ArrayResize(positions, 0);
+
    int total = PositionsTotal();
 
    for(int i = 0; i < total; i++)
@@ -254,24 +299,36 @@ bool GetBasketState(BasketState &state)
       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
          continue;
 
-      state.levels++;
-
       double profit = PositionGetDouble(POSITION_PROFIT)
                     + PositionGetDouble(POSITION_SWAP)
                     + PositionGetDouble(POSITION_COMMISSION);
       state.totalProfit += profit;
 
-      long openTime = PositionGetInteger(POSITION_TIME_MSC);
-      if(openTime > latestTime)
-      {
-         latestTime      = openTime;
-         state.lastType  = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-         state.lastPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-         state.lastTicket = ticket;
-      }
+      int idx = ArraySize(positions);
+      ArrayResize(positions, idx + 1);
+      positions[idx].ticket  = ticket;
+      positions[idx].timeMsc = PositionGetInteger(POSITION_TIME_MSC);
+      positions[idx].type    = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      positions[idx].price   = PositionGetDouble(POSITION_PRICE_OPEN);
    }
 
-   return (state.levels > 0);
+   state.levels = ArraySize(positions);
+   if(state.levels <= 0)
+      return false;
+
+   SortBasketPositionsByOpenTime(positions);
+
+   state.firstType = positions[0].type;
+   state.lastType  = positions[state.levels - 1].type;
+   state.lastPrice = positions[state.levels - 1].price;
+   state.lastTicket = positions[state.levels - 1].ticket;
+
+   if(state.lastType == POSITION_TYPE_BUY)
+      state.expectedNextType = POSITION_TYPE_SELL;
+   else
+      state.expectedNextType = POSITION_TYPE_BUY;
+
+   return true;
 }
 
 int GetTrendSignal()
@@ -296,6 +353,17 @@ double NextLotSize(int currentLevels)
    return NormalizeVolume(lot);
 }
 
+bool CanOpenTradeNow()
+{
+   ulong nowMsc = (ulong)GetTickCount64();
+
+   if(g_lastActionTickTime == nowMsc)
+      return false;
+
+   g_lastActionTickTime = nowMsc;
+   return true;
+}
+
 void TryOpenInitialPosition()
 {
    if(NewsFilter)
@@ -303,6 +371,8 @@ void TryOpenInitialPosition()
    if(!IsWithinTradingHours())
       return;
    if(CurrentSpreadPoints() > MaxSpread)
+      return;
+   if(!CanOpenTradeNow())
       return;
 
    int signal = GetTrendSignal();
@@ -329,29 +399,24 @@ void TryOpenNextGridLevel(const BasketState &state)
       return;
    if(CurrentSpreadPoints() > MaxSpread)
       return;
+   if(!CanOpenTradeNow())
+      return;
 
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double trigger = GridDistancePoints * _Point;
 
    bool shouldOpen = false;
-   ENUM_ORDER_TYPE nextType = ORDER_TYPE_BUY;
 
    if(state.lastType == POSITION_TYPE_BUY)
    {
       if(bid <= state.lastPrice - trigger)
-      {
          shouldOpen = true;
-         nextType = ORDER_TYPE_SELL;
-      }
    }
    else if(state.lastType == POSITION_TYPE_SELL)
    {
       if(ask >= state.lastPrice + trigger)
-      {
          shouldOpen = true;
-         nextType = ORDER_TYPE_BUY;
-      }
    }
 
    if(!shouldOpen)
@@ -361,6 +426,7 @@ void TryOpenNextGridLevel(const BasketState &state)
    if(lot <= 0.0)
       return;
 
+   ENUM_ORDER_TYPE nextType = (state.expectedNextType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    string comment = "Level" + IntegerToString(state.levels + 1);
    SendMarketOrder(nextType, lot, comment);
 }
