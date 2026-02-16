@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.03"
+#property version   "1.10"
 #property description "Hedging Martingale Recovery EA for MT5"
 
 input int      EMA_Fast            = 50;
@@ -17,14 +17,30 @@ input bool     NewsFilter          = false;
 input long     MagicNumber         = 20260215;
 input int      StopLossBasePoints  = 600;
 input int      StopLossStepPoints  = 150;
+input bool     UseRSIFilter         = true;
+input int      RSI_Period           = 14;
+input double   RSI_BuyMax           = 60.0;
+input double   RSI_SellMin          = 40.0;
+input bool     UseATRGrid           = true;
+input int      ATR_Period           = 14;
+input double   ATR_GridMultiplier   = 1.2;
+input int      MinGridPoints        = 250;
+input int      MaxGridPointsCap     = 1200;
+input int      CooldownMinutesAfterBasketClose = 5;
+input bool     UseAdaptiveTarget    = true;
+input double   TargetProfitPerLevel = 0.75;
+input double   MaxBasketLossUSD     = 0.0;
 
 int      g_emaFastHandle = INVALID_HANDLE;
 int      g_emaSlowHandle = INVALID_HANDLE;
+int      g_rsiHandle = INVALID_HANDLE;
+int      g_atrHandle = INVALID_HANDLE;
 double   g_initialEquity = 0.0;
 bool     g_tradingStopped = false;
 ulong    g_lastActionTickTime = 0;
 bool     g_waitingLevelConfirmation = false;
 int      g_expectedLevelsAfterSend = 0;
+datetime g_lastBasketCloseTime = 0;
 
 struct BasketState
 {
@@ -145,6 +161,78 @@ double CalculateProgressiveSL(ENUM_ORDER_TYPE type, double entryPrice, int level
       return NormalizeDouble(entryPrice - distance, digits);
 
    return NormalizeDouble(entryPrice + distance, digits);
+}
+
+
+double GetATRPoints()
+{
+   if(g_atrHandle == INVALID_HANDLE)
+      return 0.0;
+
+   double atrBuf[1];
+   if(CopyBuffer(g_atrHandle, 0, 0, 1, atrBuf) < 1)
+      return 0.0;
+
+   if(atrBuf[0] <= 0.0)
+      return 0.0;
+
+   return atrBuf[0] / _Point;
+}
+
+bool VolatilityFilterOK()
+{
+   if(!UseATRGrid)
+      return true;
+
+   double atrPoints = GetATRPoints();
+   if(atrPoints <= 0.0)
+      return false;
+
+   return (atrPoints <= (double)MaxGridPointsCap);
+}
+
+int EffectiveGridPoints()
+{
+   if(!UseATRGrid)
+      return GridDistancePoints;
+
+   double atrPoints = GetATRPoints();
+   if(atrPoints <= 0.0)
+      return GridDistancePoints;
+
+   int dynamicGrid = (int)MathRound(atrPoints * ATR_GridMultiplier);
+   if(dynamicGrid < MinGridPoints)
+      dynamicGrid = MinGridPoints;
+
+   int hardCap = MaxGridPointsCap;
+   if(hardCap > 0 && dynamicGrid > hardCap)
+      dynamicGrid = hardCap;
+
+   return dynamicGrid;
+}
+
+double BasketTargetProfitUSD(int levels)
+{
+   if(!UseAdaptiveTarget)
+      return TargetProfitUSD;
+
+   int extraLevels = levels - 1;
+   if(extraLevels < 0)
+      extraLevels = 0;
+
+   return TargetProfitUSD + extraLevels * TargetProfitPerLevel;
+}
+
+bool CooldownAfterBasketOK()
+{
+   if(CooldownMinutesAfterBasketClose <= 0)
+      return true;
+
+   if(g_lastBasketCloseTime <= 0)
+      return true;
+
+   int elapsed = (int)(TimeCurrent() - g_lastBasketCloseTime);
+   return (elapsed >= CooldownMinutesAfterBasketClose * 60);
 }
 
 double NormalizeVolume(double volume)
@@ -404,10 +492,29 @@ int GetTrendSignal()
    if(CopyBuffer(g_emaSlowHandle, 0, 0, 2, slowBuf) < 2)
       return 0;
 
+   double rsiValue = 50.0;
+   if(UseRSIFilter)
+   {
+      if(g_rsiHandle == INVALID_HANDLE)
+         return 0;
+
+      double rsiBuf[1];
+      if(CopyBuffer(g_rsiHandle, 0, 0, 1, rsiBuf) < 1)
+         return 0;
+      rsiValue = rsiBuf[0];
+   }
+
    if(fastBuf[0] > slowBuf[0])
-      return 1;
+   {
+      if(!UseRSIFilter || rsiValue <= RSI_BuyMax)
+         return 1;
+   }
+
    if(fastBuf[0] < slowBuf[0])
-      return -1;
+   {
+      if(!UseRSIFilter || rsiValue >= RSI_SellMin)
+         return -1;
+   }
 
    return 0;
 }
@@ -449,6 +556,10 @@ void TryOpenInitialPosition()
       return;
    if(CurrentSpreadPoints() > MaxSpread)
       return;
+   if(!VolatilityFilterOK())
+      return;
+   if(!CooldownAfterBasketOK())
+      return;
    if(!CanOpenTradeNow())
       return;
 
@@ -482,6 +593,10 @@ void TryOpenNextGridLevel(const BasketState &state)
       return;
    if(CurrentSpreadPoints() > MaxSpread)
       return;
+   if(!VolatilityFilterOK())
+      return;
+   if(!CooldownAfterBasketOK())
+      return;
    if(!CanOpenTradeNow())
       return;
 
@@ -493,7 +608,8 @@ void TryOpenNextGridLevel(const BasketState &state)
 
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double trigger = GridDistancePoints * _Point;
+   int gridPoints = EffectiveGridPoints();
+   double trigger = gridPoints * _Point;
 
    bool shouldOpen = false;
 
@@ -561,8 +677,10 @@ int OnInit()
 
    g_emaFastHandle = iMA(_Symbol, PERIOD_CURRENT, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
    g_emaSlowHandle = iMA(_Symbol, PERIOD_CURRENT, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+   g_rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+   g_atrHandle = iATR(_Symbol, PERIOD_CURRENT, ATR_Period);
 
-   if(g_emaFastHandle == INVALID_HANDLE || g_emaSlowHandle == INVALID_HANDLE)
+   if(g_emaFastHandle == INVALID_HANDLE || g_emaSlowHandle == INVALID_HANDLE || g_rsiHandle == INVALID_HANDLE || g_atrHandle == INVALID_HANDLE)
    {
       Print("Failed to create EMA handles.");
       return INIT_FAILED;
@@ -577,6 +695,10 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_emaFastHandle);
    if(g_emaSlowHandle != INVALID_HANDLE)
       IndicatorRelease(g_emaSlowHandle);
+   if(g_rsiHandle != INVALID_HANDLE)
+      IndicatorRelease(g_rsiHandle);
+   if(g_atrHandle != INVALID_HANDLE)
+      IndicatorRelease(g_atrHandle);
 }
 
 void OnTick()
@@ -598,9 +720,19 @@ void OnTick()
 
    if(hasBasket)
    {
-      if(state.totalProfit >= TargetProfitUSD)
+      double basketTarget = BasketTargetProfitUSD(state.levels);
+      if(state.totalProfit >= basketTarget)
       {
          CloseAllBasketPositions();
+         g_lastBasketCloseTime = TimeCurrent();
+         return;
+      }
+
+      if(MaxBasketLossUSD > 0.0 && state.totalProfit <= -MaxBasketLossUSD)
+      {
+         Print("Max basket loss reached. Closing basket.");
+         CloseAllBasketPositions();
+         g_lastBasketCloseTime = TimeCurrent();
          return;
       }
 
