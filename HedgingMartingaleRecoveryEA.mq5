@@ -82,6 +82,34 @@ ENUM_ORDER_TYPE_FILLING GetFillingMode()
    return ORDER_FILLING_RETURN;
 }
 
+
+ENUM_POSITION_TYPE OppositePositionType(ENUM_POSITION_TYPE type)
+{
+   if(type == POSITION_TYPE_BUY)
+      return POSITION_TYPE_SELL;
+   return POSITION_TYPE_BUY;
+}
+
+ENUM_POSITION_TYPE ExpectedTypeForLevel(const BasketState &state, int levelNumber)
+{
+   if(levelNumber <= 1)
+      return state.firstType;
+
+   if((levelNumber % 2) == 1)
+      return state.firstType;
+
+   return OppositePositionType(state.firstType);
+}
+
+bool IsAlternatingBasket(const BasketState &state)
+{
+   if(state.levels <= 1)
+      return true;
+
+   ENUM_POSITION_TYPE expectedLast = ExpectedTypeForLevel(state, state.levels);
+   return (expectedLast == state.lastType);
+}
+
 double NormalizeVolume(double volume)
 {
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -325,10 +353,7 @@ bool GetBasketState(BasketState &state)
    state.lastPrice = positions[state.levels - 1].price;
    state.lastTicket = positions[state.levels - 1].ticket;
 
-   if(state.lastType == POSITION_TYPE_BUY)
-      state.expectedNextType = POSITION_TYPE_SELL;
-   else
-      state.expectedNextType = POSITION_TYPE_BUY;
+   state.expectedNextType = ExpectedTypeForLevel(state, state.levels + 1);
 
    return true;
 }
@@ -419,6 +444,12 @@ void TryOpenNextGridLevel(const BasketState &state)
       return;
    if(!CanOpenTradeNow())
       return;
+
+   if(!IsAlternatingBasket(state))
+   {
+      Print("Basket structure mismatch detected. Grid expansion skipped this tick.");
+      return;
+   }
 
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
