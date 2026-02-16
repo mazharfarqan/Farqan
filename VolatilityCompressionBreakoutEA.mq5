@@ -284,17 +284,11 @@ bool SendRequestWithRetry(MqlTradeRequest &request, MqlTradeResult &result)
       int ret = (int)result.retcode;
       if(ret == TRADE_RETCODE_REQUOTE ||
          ret == TRADE_RETCODE_PRICE_CHANGED ||
-         ret == TRADE_RETCODE_TRADE_CONTEXT_BUSY ||
-         ret == TRADE_RETCODE_SERVER_BUSY ||
+         ret == TRADE_RETCODE_PRICE_OFF ||
          ret == TRADE_RETCODE_TOO_MANY_REQUESTS ||
-         ret == TRADE_RETCODE_CONNECTION)
-      {
-         Sleep(200 + attempt * 200);
-         continue;
-      }
-
-      int err = GetLastError();
-      if(err == ERR_TRADE_CONTEXT_BUSY || err == ERR_OFF_QUOTES || err == ERR_REQUOTE)
+         ret == TRADE_RETCODE_CONNECTION ||
+         ret == TRADE_RETCODE_TIMEOUT ||
+         ret == TRADE_RETCODE_LOCKED)
       {
          Sleep(200 + attempt * 200);
          continue;
@@ -665,9 +659,8 @@ int OnInit()
    return INIT_SUCCEEDED;
 }
 
-void OnDeinit(const int reason)
+void OnDeinit(const int)
 {
-   (void)reason;
    EventKillTimer();
 
    for(int i = 0; i < ArraySize(g_symbols); i++)
