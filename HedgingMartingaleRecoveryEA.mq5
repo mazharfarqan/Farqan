@@ -21,6 +21,8 @@ int      g_emaSlowHandle = INVALID_HANDLE;
 double   g_initialEquity = 0.0;
 bool     g_tradingStopped = false;
 ulong    g_lastActionTickTime = 0;
+bool     g_waitingLevelConfirmation = false;
+int      g_expectedLevelsAfterSend = 0;
 
 struct BasketState
 {
@@ -353,6 +355,18 @@ double NextLotSize(int currentLevels)
    return NormalizeVolume(lot);
 }
 
+void UpdateSendConfirmationState(int currentLevels)
+{
+   if(!g_waitingLevelConfirmation)
+      return;
+
+   if(currentLevels >= g_expectedLevelsAfterSend)
+   {
+      g_waitingLevelConfirmation = false;
+      g_expectedLevelsAfterSend = 0;
+   }
+}
+
 bool CanOpenTradeNow()
 {
    ulong nowMsc = (ulong)GetTickCount64();
@@ -384,7 +398,11 @@ void TryOpenInitialPosition()
       return;
 
    ENUM_ORDER_TYPE type = (signal > 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   SendMarketOrder(type, lot, "Level1");
+   if(SendMarketOrder(type, lot, "Level1"))
+   {
+      g_waitingLevelConfirmation = true;
+      g_expectedLevelsAfterSend = 1;
+   }
 }
 
 void TryOpenNextGridLevel(const BasketState &state)
@@ -428,7 +446,11 @@ void TryOpenNextGridLevel(const BasketState &state)
 
    ENUM_ORDER_TYPE nextType = (state.expectedNextType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    string comment = "Level" + IntegerToString(state.levels + 1);
-   SendMarketOrder(nextType, lot, comment);
+   if(SendMarketOrder(nextType, lot, comment))
+   {
+      g_waitingLevelConfirmation = true;
+      g_expectedLevelsAfterSend = state.levels + 1;
+   }
 }
 
 void CheckDrawdownProtection()
@@ -494,6 +516,11 @@ void OnTick()
 
    BasketState state;
    bool hasBasket = GetBasketState(state);
+
+   UpdateSendConfirmationState(hasBasket ? state.levels : 0);
+
+   if(g_waitingLevelConfirmation)
+      return;
 
    if(hasBasket)
    {
