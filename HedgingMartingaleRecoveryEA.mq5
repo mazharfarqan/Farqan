@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.01"
+#property version   "1.02"
 #property description "Hedging Martingale Recovery EA for MT5"
 
 input int      EMA_Fast            = 50;
@@ -15,6 +15,8 @@ input int      TradingStartHour    = 1;
 input int      TradingEndHour      = 23;
 input bool     NewsFilter          = false;
 input long     MagicNumber         = 20260215;
+input int      StopLossBasePoints  = 600;
+input int      StopLossStepPoints  = 150;
 
 int      g_emaFastHandle = INVALID_HANDLE;
 int      g_emaSlowHandle = INVALID_HANDLE;
@@ -110,6 +112,38 @@ bool IsAlternatingBasket(const BasketState &state)
    return (expectedLast == state.lastType);
 }
 
+
+double ProgressiveStopDistancePoints(int levelNumber)
+{
+   if(levelNumber < 1)
+      levelNumber = 1;
+
+   int distancePoints = StopLossBasePoints + (levelNumber - 1) * StopLossStepPoints;
+
+   int minStops = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   if(distancePoints < minStops)
+      distancePoints = minStops;
+
+   if(distancePoints < 0)
+      distancePoints = 0;
+
+   return (double)distancePoints;
+}
+
+double CalculateProgressiveSL(ENUM_ORDER_TYPE type, double entryPrice, int levelNumber)
+{
+   if(StopLossBasePoints <= 0)
+      return 0.0;
+
+   double distance = ProgressiveStopDistancePoints(levelNumber) * _Point;
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   if(type == ORDER_TYPE_BUY)
+      return NormalizeDouble(entryPrice - distance, digits);
+
+   return NormalizeDouble(entryPrice + distance, digits);
+}
+
 double NormalizeVolume(double volume)
 {
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -133,7 +167,7 @@ double NormalizeVolume(double volume)
    return NormalizeDouble(normalized, volDigits);
 }
 
-bool SendMarketOrder(ENUM_ORDER_TYPE type, double volume, string comment)
+bool SendMarketOrder(ENUM_ORDER_TYPE type, double volume, double slPrice, string comment)
 {
    MqlTradeRequest request;
    MqlTradeResult  result;
@@ -157,6 +191,7 @@ bool SendMarketOrder(ENUM_ORDER_TYPE type, double volume, string comment)
       request.price        = price;
       request.deviation    = 20;
       request.type_filling = filling;
+      request.sl           = slPrice;
       request.comment      = comment;
 
       if(OrderSend(request, result))
@@ -423,7 +458,9 @@ void TryOpenInitialPosition()
       return;
 
    ENUM_ORDER_TYPE type = (signal > 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   if(SendMarketOrder(type, lot, "Level1"))
+   double entryPrice = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double slPrice = CalculateProgressiveSL(type, entryPrice, 1);
+   if(SendMarketOrder(type, lot, slPrice, "Level1"))
    {
       g_waitingLevelConfirmation = true;
       g_expectedLevelsAfterSend = 1;
@@ -475,9 +512,12 @@ void TryOpenNextGridLevel(const BasketState &state)
    if(lot <= 0.0)
       return;
 
+   int nextLevel = state.levels + 1;
    ENUM_ORDER_TYPE nextType = (state.expectedNextType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   string comment = "Level" + IntegerToString(state.levels + 1);
-   if(SendMarketOrder(nextType, lot, comment))
+   double entryPrice = (nextType == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double slPrice = CalculateProgressiveSL(nextType, entryPrice, nextLevel);
+   string comment = "Level" + IntegerToString(nextLevel);
+   if(SendMarketOrder(nextType, lot, slPrice, comment))
    {
       g_waitingLevelConfirmation = true;
       g_expectedLevelsAfterSend = state.levels + 1;
