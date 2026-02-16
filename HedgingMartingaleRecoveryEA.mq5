@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.02"
+#property version   "1.03"
 #property description "Hedging Martingale Recovery EA for MT5"
 
 input int      EMA_Fast            = 50;
@@ -11,8 +11,8 @@ input int      MaxLevels           = 10;
 input double   TargetProfitUSD     = 5.0;
 input int      MaxSpread           = 50;
 input double   MaxDrawdownPercent  = 40.0;
-input int      TradingStartHour    = 1;
-input int      TradingEndHour      = 23;
+input int      TradingStartHour    = 0;
+input int      TradingEndHour      = 0;
 input bool     NewsFilter          = false;
 input long     MagicNumber         = 20260215;
 input int      StopLossBasePoints  = 600;
@@ -53,6 +53,9 @@ bool IsHedgingAccount()
 
 bool IsWithinTradingHours()
 {
+   if(TradingStartHour < 0 || TradingStartHour > 23 || TradingEndHour < 0 || TradingEndHour > 23)
+      return true;
+
    MqlDateTime tm;
    TimeToStruct(TimeCurrent(), tm);
 
