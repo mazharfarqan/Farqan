@@ -26,7 +26,7 @@ input double InpLevel6LossStopPercent      = 5.0;        // Stop perte si niveau
 input int    InpPauseAfterWinMinutes       = 15;         // Pause après cycle gagnant (minutes)
 input int    InpPauseAfterDDHours          = 12;         // Pause après drawdown stop (heures)
 input long   InpMagicNumber                = 20260221;   // Magic Number
-input int    InpMaxSpreadPoints            = 1200;       // Spread maximum (points)
+input int    InpMaxSpreadPoints            = 1800;       // Spread maximum (points)
 input int    InpSlippagePoints             = 50;         // Déviation max (points)
 
 //==============================
