@@ -26,7 +26,7 @@ input double InpLevel6LossStopPercent      = 5.0;        // Stop perte si niveau
 input int    InpPauseAfterWinMinutes       = 15;         // Pause après cycle gagnant (minutes)
 input int    InpPauseAfterDDHours          = 12;         // Pause après drawdown stop (heures)
 input long   InpMagicNumber                = 20260221;   // Magic Number
-input int    InpMaxSpreadPoints            = 1800;       // Spread maximum (points)
+input int    InpMaxSpreadPoints            = 2000;       // Spread maximum (points)
 input int    InpSlippagePoints             = 50;         // Déviation max (points)
 
 //==============================
@@ -41,6 +41,7 @@ int    g_handleAtrVolSlow = INVALID_HANDLE;
 datetime g_pauseUntil = 0;
 datetime g_lastBarTime = 0;
 int      g_effectiveMaxLevels = 6;
+int      g_effectiveMaxSpreadPoints = 2000;
 
 double g_cycleBalanceAnchor = 0.0;
 bool   g_profitLockActive = false;
@@ -175,9 +176,9 @@ bool SpreadOK()
       return false;
 
    double spreadPoints = (tick.ask - tick.bid) / _Point;
-   if(spreadPoints > InpMaxSpreadPoints)
+   if(spreadPoints > g_effectiveMaxSpreadPoints)
    {
-      PrintFormat("[SPREAD] Filtre actif. Spread=%.1f > max=%d points", spreadPoints, InpMaxSpreadPoints);
+      PrintFormat("[SPREAD] Filtre actif. Spread=%.1f > max=%d points", spreadPoints, g_effectiveMaxSpreadPoints);
       return false;
    }
    return true;
@@ -475,6 +476,13 @@ int OnInit()
 
    if(InpMaxLevels != g_effectiveMaxLevels)
       PrintFormat("[INIT] InpMaxLevels ajusté à %d (limite stricte).", g_effectiveMaxLevels);
+
+   g_effectiveMaxSpreadPoints = InpMaxSpreadPoints;
+   if(g_effectiveMaxSpreadPoints < 1800)
+   {
+      g_effectiveMaxSpreadPoints = 1800;
+      PrintFormat("[INIT] InpMaxSpreadPoints ajusté à %d (minimum recommandé BTCUSD).", g_effectiveMaxSpreadPoints);
+   }
 
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(InpSlippagePoints);
